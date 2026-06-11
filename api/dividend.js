@@ -48,21 +48,23 @@ module.exports = async function handler(req, res) {
     let dividendYield = 0;
 
     try {
-      const v10url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=summaryDetail`;
-      const v10data = await fetchURL(v10url);
-      const result = v10data && v10data.quoteSummary && v10data.quoteSummary.result && v10data.quoteSummary.result[0];
-      const summary = result && result.summaryDetail;
-
-      if (summary) {
-        const dividendRate = (summary.dividendRate && summary.dividendRate.raw) || 0;
+      // 用 quote endpoint 拿股息數據
+      const quoteUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}&fields=trailingAnnualDividendRate,trailingAnnualDividendYield,dividendRate`;
+      const quoteData = await fetchURL(quoteUrl);
+      const quoteResult = quoteData &&
+        quoteData.quoteResponse &&
+        quoteData.quoteResponse.result &&
+        quoteData.quoteResponse.result[0];
+    
+      if (quoteResult) {
+        const dividendRate = quoteResult.trailingAnnualDividendRate || 0;
         const isUK = symbol.endsWith('.L');
         const adjustedPrice = isUK ? price / 100 : price;
-
+    
         if (dividendRate && adjustedPrice > 0) {
           dividendYield = dividendRate / adjustedPrice;
         } else {
-          const yieldVal = (summary.dividendYield && summary.dividendYield.raw) ||
-            (summary.trailingAnnualDividendYield && summary.trailingAnnualDividendYield.raw) || 0;
+          const yieldVal = quoteResult.trailingAnnualDividendYield || 0;
           if (yieldVal > 0 && yieldVal < 0.5) {
             dividendYield = yieldVal;
           }
