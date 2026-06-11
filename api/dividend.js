@@ -13,8 +13,11 @@ function fetchURL(url) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error('Parse error')); }
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error('Parse error'));
+        }
       });
     }).on('error', reject);
   });
@@ -22,32 +25,68 @@ function fetchURL(url) {
 
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
 
   const { symbol } = req.query;
-  if (!symbol) return res.status(400).json({ error: 'Symbol required' });
+  if (!symbol) {
+    return res.status(400).json({ error: 'Symbol required' });
+  }
 
   try {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
     const data = await fetchURL(url);
-    const meta = data?.chart?.result?.[0]?.meta;
+    const meta = data && data.chart && data.chart.result && data.chart.result[0] && data.chart.result[0].meta;
 
-    if (!meta) return res.status(404).json({ error: 'No data', symbol, dividendYield: 0 });
+    if (!meta) {
+      return res.status(404).json({ error: 'No data', symbol: symbol, dividendYield: 0 });
+    }
 
-    const price = meta.regularMarketPrice ?? 0;
-    const prev = meta.chartPreviousClose ?? price;
-    const currency = meta.currency ?? 'USD';
+    const price = meta.regularMarketPrice || 0;
+    const prev = meta.chartPreviousClose || price;
+    const currency = meta.currency || 'USD';
 
-    // 試用 v10 拿股息
     let dividendYield = 0;
+
     try {
       const v10url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=summaryDetail`;
       const v10data = await fetchURL(v10url);
-      const summary = v10data?.quoteSummary?.result?.[0]?.summaryDetail;
-      const dividendRate = summary?.dividendRate?.raw ?? 0;
-      const isUK = symbol.endsWith('.L');
-      const adjustedPrice = isUK ? price / 100 : price;
+      const result = v10data && v10data.quoteSummary && v10data.quoteSummary.result && v10data.quoteSummary.result[0];
+      const summary = result && result.summaryDetail;
 
-      if (dividendRate && adjustedPrice > 0) {
-        dividendYield = dividendRate / adjustedPrice;
-      } else {
-        const yieldVal = summary?.d
+      if (summary) {
+        const dividendRate = (summary.dividendRate && summary.dividendRate.raw) || 0;
+        const isUK = symbol.endsWith('.L');
+        const adjustedPrice = isUK ? price / 100 : price;
+
+        if (dividendRate && adjustedPrice > 0) {
+          dividendYield = dividendRate / adjustedPrice;
+        } else {
+          const yieldVal = (summary.dividendYield && summary.dividendYield.raw) ||
+            (summary.trailingAnnualDividendYield && summary.trailingAnnualDividendYield.raw) || 0;
+          if (yieldVal > 0 && yieldVal < 0.5) {
+            dividendYield = yieldVal;
+          }
+        }
+      }
+    } catch (e) {
+      dividendYield = 0;
+    }
+
+    return res.status(200).json({
+      symbol: symbol,
+      price: price,
+      change: price - prev,
+      changePct: prev > 0 ? ((price - prev) / prev) * 100 : 0,
+      currency: currency,
+      dividendYield: Math.round(dividendYield * 1000000) / 1000000,
+      source: 'yahoo',
+    });
+
+  } catch (error) {
+    return res.status(500).json({
+      error: error.message,
+      symbol: symbol,
+      dividendYield: 0,
+    });
+  }
+};
