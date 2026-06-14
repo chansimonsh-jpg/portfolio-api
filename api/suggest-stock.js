@@ -1,130 +1,105 @@
-// api/suggest-stock.js
-//
-// 用戶 "+ Add manually" 後，real-time fetch 成功，
-// 將新 symbol 上報為 GitHub issue，方便 review 後加入 stocks.json
-//
-// 環境變數需要設定（Vercel project settings -> Environment Variables）：
-//   GITHUB_TOKEN  - Fine-grained PAT, scope: chansimonsh-jpg/portfolio-stocks -> Issues: Read & Write
-//   GITHUB_REPO   - 例如 "chansimonsh-jpg/portfolio-stocks"
+import json
+import time
+from datetime import datetime
 
-const GITHUB_API = 'https://api.github.com';
-const MAX_PER_IP_PER_DAY = 5;
+import yfinance as yf
 
-// 簡單 in-memory rate limit（Vercel serverless 冷啟動會重置，
-// 加上 GitHub issue 去重作為第二層保護）
-const rateLimitStore = new Map(); // key: "ip:date" -> count
+# 主要貨幣兌 USD 匯率
+# Yahoo Finance currency pair 格式: "{CCY}USD=X" 即 1 unit of CCY = X USD
+CURRENCIES = ["HKD", "GBP", "SGD", "IDR", "MYR", "CNY"]
 
-function getClientIp(req) {
-  const fwd = req.headers['x-forwarded-for'];
-  if (fwd) return fwd.split(',')[0].trim();
-  return req.socket?.remoteAddress || 'unknown';
-}
+MAX_RETRIES = 3
+RETRY_DELAY = 5
+REQUEST_DELAY = 1.5
 
-function checkRateLimit(ip) {
-  const today = new Date().toISOString().split('T')[0];
-  const key = `${ip}:${today}`;
-  const count = rateLimitStore.get(key) || 0;
-  if (count >= MAX_PER_IP_PER_DAY) return false;
-  rateLimitStore.set(key, count + 1);
-  // 清理舊 entries，避免 map 無限增長
-  if (rateLimitStore.size > 1000) {
-    for (const k of rateLimitStore.keys()) {
-      if (!k.endsWith(today)) rateLimitStore.delete(k);
-    }
-  }
-  return true;
-}
 
-async function findExistingIssue(repo, token, title) {
-  const query = encodeURIComponent(`repo:${repo} type:issue in:title "${title}"`);
-  const res = await fetch(`${GITHUB_API}/search/issues?q=${query}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/vnd.github+json',
-      'User-Agent': 'portfolio-api',
-    },
-  });
-  if (!res.ok) return false;
-  const data = await res.json();
-  return (data.total_count ?? 0) > 0;
-}
+def fetch_rate(currency):
+    """回傳 1 unit of currency 兌 USD 嘅匯率 (USD per 1 unit)"""
+    symbol = f"{currency}USD=X"
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            price = (
+                info.get("regularMarketPrice")
+                or info.get("currentPrice")
+                or info.get("previousClose")
+                or 0
+            )
+            if price and float(price) > 0:
+                rate = float(price)
+                print(f"  {currency}: 1 {currency} = {rate:.6f} USD")
+                return rate
 
-async function createIssue(repo, token, title, body) {
-  const res = await fetch(`${GITHUB_API}/repos/${repo}/issues`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/vnd.github+json',
-      'User-Agent': 'portfolio-api',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      title,
-      body,
-      labels: ['new-symbol', 'auto-suggested'],
-    }),
-  });
-  return res.ok;
-}
+            print(f"  {currency}: no price data")
+            return None
 
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        except Exception as e:
+            print(f"  {currency}: attempt {attempt}/{MAX_RETRIES} failed - {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"  {currency}: giving up after {MAX_RETRIES} attempts")
+                return None
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
 
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+def main():
+    print(f"Fetching FX rates for {len(CURRENCIES)} currencies (vs USD)...")
 
-  const { symbol, name, market, exchange, currency } = req.body || {};
+    # 讀取現有資料作為 fallback
+    existing_rates = {}
+    version = "1.0.0"
+    try:
+        with open("rates.json", "r") as f:
+            existing = json.load(f)
+            existing_rates = existing.get("rates", {})
+            parts = existing.get("version", "1.0.0").split(".")
+            parts[2] = str(int(parts[2]) + 1)
+            version = ".".join(parts)
+    except Exception:
+        pass
 
-  if (!symbol || !name) {
-    return res.status(400).json({ error: 'symbol and name are required' });
-  }
+    rates = {"USD": 1.0}
+    success = 0
+    failed = 0
+    errors = []
 
-  const token = process.env.GITHUB_TOKEN;
-  const repo = process.env.GITHUB_REPO;
+    for i, currency in enumerate(CURRENCIES, 1):
+        rate = fetch_rate(currency)
 
-  if (!token || !repo) {
-    // 未設定 GitHub 整合，靜默成功（唔影響 app 主流程）
-    return res.status(200).json({ ok: true, reported: false, reason: 'not_configured' });
-  }
+        if rate is None:
+            fallback = existing_rates.get(currency)
+            if fallback:
+                rates[currency] = fallback
+                print(f"  {currency}: using cached rate {fallback}")
+            failed += 1
+            errors.append(currency)
+        else:
+            rates[currency] = round(rate, 6)
+            success += 1
 
-  const ip = getClientIp(req);
-  if (!checkRateLimit(ip)) {
-    return res.status(429).json({ ok: false, reported: false, reason: 'rate_limited' });
-  }
+        if i < len(CURRENCIES):
+            time.sleep(REQUEST_DELAY)
 
-  const title = `[Auto] New symbol: ${symbol} - ${name}`;
-
-  try {
-    const exists = await findExistingIssue(repo, token, title);
-    if (exists) {
-      return res.status(200).json({ ok: true, reported: false, reason: 'duplicate' });
+    output = {
+        "version": version,
+        "updatedAt": datetime.utcnow().strftime("%Y-%m-%d"),
+        "base": "USD",
+        "rates": rates,
     }
 
-    const body = [
-      'A user added this symbol via "+ Add manually" and real-time fetch succeeded.',
-      '',
-      '| Field | Value |',
-      '|---|---|',
-      `| symbol | \`${symbol}\` |`,
-      `| name | ${name} |`,
-      `| market | ${market ?? '?'} |`,
-      `| exchange | ${exchange ?? '?'} |`,
-      `| currency | ${currency ?? '?'} |`,
-      '',
-      'Review and add to `stocks.json` if appropriate, then close this issue.',
-    ].join('\n');
+    with open("rates.json", "w") as f:
+        json.dump(output, f, indent=2)
 
-    const created = await createIssue(repo, token, title, body);
-    return res.status(200).json({ ok: true, reported: created });
-  } catch (e) {
-    // 上報失敗唔應該影響用戶 add holding，靜默處理
-    return res.status(200).json({ ok: true, reported: false, reason: 'error' });
-  }
-}
+    print(f"\nDone! {success} fetched, {failed} fallback/failed")
+    print(f"Updated rates.json to version {version}")
+
+    if errors:
+        print(f"\n[warn] Failed to fetch (kept old/missing): {', '.join(errors)}")
+        if len(errors) > len(CURRENCIES) * 0.5:
+            print(f"\n[error] Too many failures ({len(errors)}/{len(CURRENCIES)}), failing the job")
+            exit(1)
+
+
+if __name__ == "__main__":
+    main()
