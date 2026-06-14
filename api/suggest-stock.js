@@ -49,7 +49,7 @@ async function findExistingIssue(repo, token, title) {
   return (data.total_count ?? 0) > 0;
 }
 
-async function createIssue(repo, token, title, body) {
+async function createIssue(repo, token, title, body, labels) {
   const res = await fetch(`${GITHUB_API}/repos/${repo}/issues`, {
     method: 'POST',
     headers: {
@@ -61,7 +61,7 @@ async function createIssue(repo, token, title, body) {
     body: JSON.stringify({
       title,
       body,
-      labels: ['new-symbol', 'auto-suggested'],
+      labels,
     }),
   });
   return res.ok;
@@ -80,7 +80,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const { symbol, name, market, exchange, currency, type, suffix } = req.body || {};
+  const { symbol, name, market, exchange, currency, type, suffix, mismatch, oldName } = req.body || {};
 
   if (!symbol || !name) {
     return res.status(400).json({ error: 'symbol and name are required' });
@@ -99,7 +99,9 @@ export default async function handler(req, res) {
     return res.status(429).json({ ok: false, reported: false, reason: 'rate_limited' });
   }
 
-  const title = `[Auto] New symbol: ${symbol} - ${name}`;
+  const title = mismatch
+    ? `[Auto] Name mismatch: ${symbol} - "${oldName}" -> "${name}"`
+    : `[Auto] New symbol: ${symbol} - ${name}`;
 
   try {
     const exists = await findExistingIssue(repo, token, title);
@@ -121,27 +123,47 @@ export default async function handler(req, res) {
       .map((line, i) => (i === 0 ? line : '    ' + line))
       .join('\n');
 
-    const body = [
-      'A user added this symbol via "+ Add manually" and real-time fetch succeeded.',
-      '',
-      '**Ready to paste into `stocks.json` (inside the `stocks` array):**',
-      '```json',
-      entryJson + ',',
-      '```',
-      '',
-      '| Field | Value |',
-      '|---|---|',
-      `| symbol | \`${symbol}\` |`,
-      `| name | ${name} |`,
-      `| market | ${market ?? '?'} |`,
-      `| exchange | ${exchange ?? '?'} |`,
-      `| currency | ${currency ?? '?'} |`,
-      `| suffix | ${suffix ? `\`${suffix}\`` : '(none)'} |`,
-      '',
-      'Review (especially the company name and exchange), paste into `stocks.json`, bump `version`, then close this issue.',
-    ].join('\n');
+    const body = mismatch
+      ? [
+          `\`stocks.json\` has \`"name": "${oldName}"\` for \`${symbol}\`, but Yahoo Finance returns a different name.`,
+          '',
+          '**Updated entry — replace the existing one in `stocks.json`:**',
+          '```json',
+          entryJson + ',',
+          '```',
+          '',
+          '| Field | stocks.json (old) | Yahoo Finance (new) |',
+          '|---|---|---|',
+          `| name | ${oldName} | ${name} |`,
+          `| exchange | - | ${exchange ?? '?'} |`,
+          '',
+          'Verify and update `stocks.json` (bump `version`), then close this issue.',
+        ].join('\n')
+      : [
+          'A user added this symbol via "+ Add manually" and real-time fetch succeeded.',
+          '',
+          '**Ready to paste into `stocks.json` (inside the `stocks` array):**',
+          '```json',
+          entryJson + ',',
+          '```',
+          '',
+          '| Field | Value |',
+          '|---|---|',
+          `| symbol | \`${symbol}\` |`,
+          `| name | ${name} |`,
+          `| market | ${market ?? '?'} |`,
+          `| exchange | ${exchange ?? '?'} |`,
+          `| currency | ${currency ?? '?'} |`,
+          `| suffix | ${suffix ? `\`${suffix}\`` : '(none)'} |`,
+          '',
+          'Review (especially the company name and exchange), paste into `stocks.json`, bump `version`, then close this issue.',
+        ].join('\n');
 
-    const created = await createIssue(repo, token, title, body);
+    const labels = mismatch
+      ? ['name-mismatch', 'auto-suggested']
+      : ['new-symbol', 'auto-suggested'];
+
+    const created = await createIssue(repo, token, title, body, labels);
     return res.status(200).json({ ok: true, reported: created });
   } catch (e) {
     // 上報失敗唔應該影響用戶 add holding，靜默處理
